@@ -1,0 +1,83 @@
+# Builds the headless (GTK/WebKit-free) Linux binary in the cloud so neither
+# the dev machine nor the server needs a Rust toolchain. The build runs inside
+# an AlmaLinux 9 container because Rocky/RHEL 9 ships glibc 2.34 — a binary
+# built on a newer-glibc distro (e.g. the ubuntu-latest host itself) would
+# refuse to start on Rocky 9.
+#
+# Trigger: "Actions" tab -> "build-headless-linux" -> "Run workflow", or any
+# push to feat/headless-serve. The result is published two ways:
+#   1. A workflow artifact (visible on the run page).
+#   2. A rolling prerelease tagged `headless-latest`, so the server can pull
+#      the package directly:
+#        curl -LO https://github.com/nashsu/llm_wiki/releases/download/headless-latest/llm-wiki-linux-x86_64.tar.gz
+#      (If the repo is private, add: -H "Authorization: Bearer <github-token>")
+
+name: build-headless-linux
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/headless-serve]
+
+permissions:
+  contents: write # required to publish the rolling release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: almalinux:9
+    timeout-minutes: 120
+    steps:
+      # actions/checkout and the other JS actions need node and git inside the
+      # container, so the toolchain install must come first.
+      - name: Install build toolchain
+        run: |
+          dnf groupinstall -y "Development Tools"
+          dnf install -y git curl protobuf-compiler openssl-devel cmake
+          dnf module install -y nodejs:20/common
+          dnf clean all
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          node --version
+          cargo --version || "$HOME/.cargo/bin/cargo" --version
+
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build headless binary
+        run: |
+          cargo build --release --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features headless
+
+      - name: Package binary + frontend
+        run: |
+          mkdir -p package/llm-wiki-linux-x86_64/frontend
+          cp src-tauri/target/release/llm-wiki package/llm-wiki-linux-x86_64/
+          cp -r dist/. package/llm-wiki-linux-x86_64/frontend/
+          tar -czf llm-wiki-linux-x86_64.tar.gz -C package llm-wiki-linux-x86_64
+          ls -lh llm-wiki-linux-x86_64.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-wiki-linux-x86_64
+          path: llm-wiki-linux-x86_64.tar.gz
+          retention-days: 30
+
+      - name: Publish rolling prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: headless-latest
+          name: Headless Linux build (Rocky/RHEL 9)
+          prerelease: true
+          files: llm-wiki-linux-x86_64.tar.gz
