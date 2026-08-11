@@ -8,6 +8,7 @@ mod events;
 mod panic_guard;
 mod proxy;
 mod server_bind;
+#[cfg(not(feature = "headless"))]
 mod tray;
 mod types;
 mod ui_routes;
@@ -18,6 +19,17 @@ use serde_json::Value;
 use std::sync::Mutex;
 use tauri::Manager;
 use uuid::Uuid;
+
+/// Concrete app handle for the active build: `AppHandle<Wry>` for the desktop
+/// build, `AppHandle<MockRuntime>` for the headless build. The rest of the
+/// crate uses this alias instead of bare `crate::AppHandle` because the
+/// `wry` feature supplies a default type parameter (`= Wry`) that is absent
+/// when `wry` is disabled, which would require every call site to name the
+/// runtime explicitly.
+#[cfg(feature = "headless")]
+pub(crate) type AppHandle = tauri::AppHandle<tauri::test::MockRuntime>;
+#[cfg(not(feature = "headless"))]
+pub(crate) type AppHandle = tauri::AppHandle;
 
 struct CloseBehaviorState(Mutex<String>);
 struct TrayAvailabilityState(Mutex<bool>);
@@ -66,7 +78,7 @@ fn api_server_reload_config() -> String {
 
 #[tauri::command]
 async fn agent_start_turn(
-    app: tauri::AppHandle,
+    app: crate::AppHandle,
     project_id: String,
     mut request: agent::AgentChatRequest,
 ) -> Result<agent::types::AgentChatResponse, String> {
@@ -139,7 +151,7 @@ async fn agent_start_turn(
 
 #[tauri::command]
 fn agent_cancel_turn(
-    app: tauri::AppHandle,
+    app: crate::AppHandle,
     project_id: String,
     session_id: String,
     run_id: Option<String>,
@@ -152,7 +164,7 @@ fn agent_cancel_turn(
 
 #[tauri::command]
 async fn agent_start_turn_stream(
-    app: tauri::AppHandle,
+    app: crate::AppHandle,
     project_id: String,
     mut request: agent::AgentChatRequest,
 ) -> Result<String, String> {
@@ -259,7 +271,7 @@ async fn agent_start_turn_stream(
 
 #[tauri::command]
 fn agent_get_session(
-    app: tauri::AppHandle,
+    app: crate::AppHandle,
     project_id: String,
     session_id: String,
     limit: Option<usize>,
@@ -276,7 +288,7 @@ fn agent_get_session(
 
 #[tauri::command]
 fn agent_list_sessions(
-    app: tauri::AppHandle,
+    app: crate::AppHandle,
     project_id: String,
 ) -> Result<Vec<agent::session::AgentSession>, String> {
     let project = resolve_agent_project(&app, &project_id)?;
@@ -286,7 +298,7 @@ fn agent_list_sessions(
 }
 
 #[tauri::command]
-fn mcp_server_entry_path(app: tauri::AppHandle) -> Result<String, String> {
+fn mcp_server_entry_path(app: crate::AppHandle) -> Result<String, String> {
     run_guarded("mcp_server_entry_path", || {
         let relative = std::path::Path::new("mcp-server")
             .join("dist")
@@ -329,7 +341,7 @@ fn mcp_server_entry_path(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 fn resolve_agent_project(
-    app: &tauri::AppHandle,
+    app: &crate::AppHandle,
     project_id: &str,
 ) -> Result<AgentProjectEntry, String> {
     let decoded = percent_decode(project_id);
@@ -344,7 +356,7 @@ fn resolve_agent_project(
         .ok_or_else(|| format!("Unknown project: {decoded}"))
 }
 
-fn load_agent_projects(app: &tauri::AppHandle) -> Vec<AgentProjectEntry> {
+fn load_agent_projects(app: &crate::AppHandle) -> Vec<AgentProjectEntry> {
     let current = normalize_path(&clip_server::current_project_path());
     let mut projects = Vec::new();
     if let Some(parsed) = load_agent_app_state(app) {
@@ -403,13 +415,13 @@ fn load_agent_projects(app: &tauri::AppHandle) -> Vec<AgentProjectEntry> {
     projects
 }
 
-fn load_agent_app_state(app: &tauri::AppHandle) -> Option<Value> {
+fn load_agent_app_state(app: &crate::AppHandle) -> Option<Value> {
     let path = app.path().app_data_dir().ok()?.join("app-state.json");
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
-fn load_agent_runtime_config(app: &tauri::AppHandle) -> AgentRuntimeConfig {
+fn load_agent_runtime_config(app: &crate::AppHandle) -> AgentRuntimeConfig {
     let Some(parsed) = load_agent_app_state(app) else {
         return AgentRuntimeConfig::default();
     };
@@ -531,6 +543,7 @@ fn set_close_behavior(
     Ok(normalized)
 }
 
+#[cfg(not(feature = "headless"))]
 fn close_behavior<R: tauri::Runtime>(window: &tauri::Window<R>) -> String {
     window
         .state::<CloseBehaviorState>()
@@ -540,6 +553,7 @@ fn close_behavior<R: tauri::Runtime>(window: &tauri::Window<R>) -> String {
         .unwrap_or_else(|_| "minimize".to_string())
 }
 
+#[cfg(not(feature = "headless"))]
 fn tray_available<R: tauri::Runtime>(window: &tauri::Window<R>) -> bool {
     window
         .state::<TrayAvailabilityState>()
@@ -630,18 +644,34 @@ fn report_serve_url_when_ready(token: String, no_open: bool) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let serve = parse_serve_args();
+    #[cfg(not(feature = "headless"))]
     if !serve.enabled {
         apply_linux_webkit_compat_env();
     }
+    #[cfg(feature = "headless")]
+    let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+    #[cfg(not(feature = "headless"))]
     let mut context = tauri::generate_context!();
+    #[cfg(feature = "headless")]
+    {
+        // mock_context ships an empty identifier, which would make
+        // app_data_dir() resolve to a degenerate path and break app-state
+        // and proxy-config reads/writes. Pin it to the same bundle id the
+        // desktop app uses so a machine that runs both shares one data dir.
+        context.config_mut().identifier = "com.llmwiki.app".to_string();
+    }
     if serve.enabled {
         // Windowless: the UI is served over HTTP and opened in a browser.
         context.config_mut().app.windows.clear();
     }
 
-    tauri::Builder::default()
+    #[cfg(feature = "headless")]
+    let builder = tauri::test::mock_builder();
+    #[cfg(not(feature = "headless"))]
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+
+    let builder = builder
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -720,11 +750,18 @@ pub fn run() {
                 // No window and no tray in serve mode: the browser tab is the UI.
                 false
             } else {
-                match tray::create_tray(app.handle()) {
-                    Ok(()) => true,
-                    Err(err) => {
-                        eprintln!("[tray] system tray unavailable, continuing without it: {err}");
-                        false
+                #[cfg(feature = "headless")]
+                {
+                    false
+                }
+                #[cfg(not(feature = "headless"))]
+                {
+                    match tray::create_tray(app.handle()) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            eprintln!("[tray] system tray unavailable, continuing without it: {err}");
+                            false
+                        }
                     }
                 }
             };
@@ -814,54 +851,59 @@ pub fn run() {
             commands::file_sync::ignore_file_change_task,
             set_proxy_env,
             set_close_behavior,
-        ])
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let behavior = close_behavior(window);
-                let win = window.clone();
-                let app = window.app_handle().clone();
-                match behavior.as_str() {
-                    "exit" => {
-                        tauri::async_runtime::spawn(async move {
-                            let _ = win.destroy();
-                            app.exit(0);
-                        });
-                    }
-                    "minimize" => {
-                        if tray_available(window) {
-                            let _ = window.hide();
-                        } else {
-                            let _ = window.minimize();
-                        }
-                    }
-                    _ => {
-                        tauri::async_runtime::spawn(async move {
-                            use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
-                            let confirmed = app
-                                .dialog()
-                                .message(
-                                    "Quit LLM Wiki? Choose Quit to exit. Choose Hide Window to keep background features running.",
-                                )
-                                .title("LLM Wiki")
-                                .buttons(MessageDialogButtons::OkCancelCustom(
-                                    "Quit".to_string(),
-                                    "Hide Window".to_string(),
-                                ))
-                                .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-                                .blocking_show();
-
-                            if confirmed {
-                                let _ = win.destroy();
-                                app.exit(0);
-                            } else {
-                                let _ = win.hide();
-                            }
-                        });
+        ]);
+    // Desktop-only: the close-to-tray/minimize/quit confirmation uses the
+    // dialog plugin and window APIs that are absent in headless builds.
+    #[cfg(not(feature = "headless"))]
+    let builder = builder.on_window_event(|window, event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let behavior = close_behavior(window);
+            let win = window.clone();
+            let app = window.app_handle().clone();
+            match behavior.as_str() {
+                "exit" => {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = win.destroy();
+                        app.exit(0);
+                    });
+                }
+                "minimize" => {
+                    if tray_available(window) {
+                        let _ = window.hide();
+                    } else {
+                        let _ = window.minimize();
                     }
                 }
+                _ => {
+                    tauri::async_runtime::spawn(async move {
+                        use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+                        let confirmed = app
+                            .dialog()
+                            .message(
+                                "Quit LLM Wiki? Choose Quit to exit. Choose Hide Window to keep background features running.",
+                            )
+                            .title("LLM Wiki")
+                            .buttons(MessageDialogButtons::OkCancelCustom(
+                                "Quit".to_string(),
+                                "Hide Window".to_string(),
+                            ))
+                            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+                            .blocking_show();
+
+                        if confirmed {
+                            let _ = win.destroy();
+                            app.exit(0);
+                        } else {
+                            let _ = win.hide();
+                        }
+                    });
+                }
             }
-        })
+        }
+    });
+
+    builder
         .build(context)
         .expect("error while building tauri application")
         .run(|app, event| {
@@ -883,7 +925,7 @@ pub fn run() {
         });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "headless")))]
 fn apply_linux_webkit_compat_env() {
     // WebKitGTK can crash or withdraw its window on some Wayland/XWayland
     // stacks unless accelerated render paths are disabled before the WebView
@@ -902,5 +944,5 @@ fn apply_linux_webkit_compat_env() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(feature = "headless")))]
 fn apply_linux_webkit_compat_env() {}

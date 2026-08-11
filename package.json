@@ -11,6 +11,8 @@
     "preview": "vite preview",
     "serve": "npm run build && cargo run --manifest-path src-tauri/Cargo.toml -- serve",
     "serve:release": "npm run build && cargo run --release --manifest-path src-tauri/Cargo.toml -- serve",
+    "serve:headless": "npm run build && cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --features headless -- serve",
+    "build:headless": "npm run build && cargo build --release --manifest-path src-tauri/Cargo.toml --no-default-features --features headless",
     "test": "npm run test:mocks && npm run test:llm",
     "test:mocks": "vitest run --exclude='**/*.real-llm.test.ts' --exclude='**/mcp-server/**'",
     "test:llm": "vitest run real-llm --no-file-parallelism --reporter=verbose",

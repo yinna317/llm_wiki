@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use tauri::AppHandle;
+use crate::AppHandle;
 use tiny_http::{Header, Method, Response, Server};
 
 use crate::cors::{local_cors_headers, request_origin};

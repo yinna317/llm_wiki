@@ -19,17 +19,49 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "llm-wiki"
 path = "src/main.rs"
 
+[features]
+# Default build: full desktop app with the Tauri webview (wry), tray icon and
+# native dialogs. Behavior is unchanged from before this feature split.
+default = ["desktop"]
+desktop = [
+    "tauri/wry",
+    "tauri/tray-icon",
+    "tauri/compression",
+    "tauri/dynamic-acl",
+    "tauri/x11",
+    "tauri/dbus",
+    "tauri/common-controls-v6",
+    "dep:tauri-plugin-dialog",
+]
+# Headless build: drops wry (and therefore webkit2gtk / Webview2) and the
+# dialog plugin (rfd -> gtk on Linux) so the binary links neither GTK nor
+# WebKit. Uses tauri's MockRuntime to drive the app without a window, so the
+# `serve` subcommand runs on stock servers (Rocky/RHEL 9, containers) with
+# only glibc + openssl. Build with:
+#   cargo build --release --no-default-features --features headless
+# `protocol-asset` stays in the base tauri declaration below because
+# tauri-build statically checks it against tauri.conf.json's assetProtocol.
+headless = ["tauri/test"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset", "tray-icon"] }
+# `default-features = false` so the `headless` feature can opt out of wry.
+# The `desktop` feature re-adds wry + tray-icon. `protocol-asset` is required
+# by tauri-build (matches tauri.conf.json assetProtocol) and links no GUI
+# libs, so it lives in the base declaration for both builds.
+tauri = { version = "2", default-features = false, features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
 tauri-plugin-autostart = "2.5.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["clock"] }
-tauri-plugin-dialog = "2.7.1"
+# rfd links gtk-sys/glib-sys on Linux, so the dialog plugin is optional and
+# only pulled in by the `desktop` feature. Browser/serve mode never uses
+# native dialogs (the frontend shim returns cancelled), so headless builds
+# omit it entirely to stay GTK-free.
+tauri-plugin-dialog = { version = "2.7.1", optional = true }
 pdfium-render = "0.9"
 tauri-plugin-store = "2.4.2"
 tauri-plugin-http = { version = "2", features = ["unsafe-headers"] }

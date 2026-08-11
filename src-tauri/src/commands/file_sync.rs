@@ -11,7 +11,8 @@ use std::time::Duration;
 use md5::{Digest, Md5};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use crate::AppHandle;
+use tauri::State;
 use walkdir::WalkDir;
 
 use crate::panic_guard::run_guarded;

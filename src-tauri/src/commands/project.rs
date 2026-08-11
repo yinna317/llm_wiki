@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use chrono::Local;
-use tauri::AppHandle;
+use crate::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::panic_guard::run_guarded;

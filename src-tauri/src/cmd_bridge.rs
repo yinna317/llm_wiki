@@ -9,7 +9,8 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use tauri::{AppHandle, Manager};
+use crate::AppHandle;
+use tauri::Manager;
 
 use crate::{agent, commands, proxy};
 
