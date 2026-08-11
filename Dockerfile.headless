@@ -1,0 +1,28 @@
+# Build the headless (GTK/WebKit-free) Linux binary for Rocky/RHEL 9.
+# Usage:
+#   docker build -t llm-wiki-headless -f Dockerfile.headless .
+#   docker create --name lwtmp llm-wiki-headless
+#   docker cp lwtmp:/build/src-tauri/target/release/llm-wiki ./llm-wiki
+#   docker rm lwtmp
+# Then scp ./llm-wiki to the server.
+
+FROM almalinux:9
+
+# Build tools + native deps. No GTK/WebKit needed (headless build).
+RUN dnf groupinstall -y "Development Tools" && \
+    dnf install -y protobuf-compiler openssl-devel cmake && \
+    dnf module install -y nodejs:20/common && \
+    dnf clean all
+
+# Rust toolchain
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /build
+COPY . .
+
+# Frontend + headless backend binary
+RUN npm ci && \
+    npm run build && \
+    cargo build --release --manifest-path src-tauri/Cargo.toml \
+        --no-default-features --features headless
