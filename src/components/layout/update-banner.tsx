@@ -1,7 +1,7 @@
 import { useCallback } from "react"
 import { Sparkles, X, Download } from "lucide-react"
 import { useTranslation } from "react-i18next"
-import { openUrl } from "@tauri-apps/plugin-opener"
+import { openUrl } from "@/lib/tauri-opener"
 import { useUpdateStore, shouldShowUpdateBanner } from "@/stores/update-store"
 import { saveUpdateCheckState } from "@/lib/project-store"
 import { toLatestReleaseUrl } from "@/lib/update-check"

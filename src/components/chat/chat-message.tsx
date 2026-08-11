@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useRef, useState, useMemo } from "react"
 import { useTranslation } from "react-i18next"
-import { convertFileSrc } from "@tauri-apps/api/core"
+import { convertFileSrc } from "@/lib/tauri-core"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
@@ -11,7 +11,7 @@ import {
   Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, Layout, Globe,
   TrendingUp, Target, Sparkles, Image as ImageIcon, FileSearch, Terminal,
 } from "lucide-react"
-import { openUrl } from "@tauri-apps/plugin-opener"
+import { openUrl } from "@/lib/tauri-opener"
 import { useWikiStore } from "@/stores/wiki-store"
 import { readFile, writeFile, listDirectory } from "@/commands/fs"
 import { lastQueryPages } from "@/components/chat/chat-panel"

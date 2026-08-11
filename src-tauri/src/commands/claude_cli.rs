@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -387,9 +387,10 @@ pub async fn claude_cli_spawn(
         loop {
             match reader.next_line().await {
                 Ok(Some(line)) => {
-                    if app.emit(&topic, line).is_err() {
-                        break;
-                    }
+                    // Emitting also feeds the browser-mode SSE bus; unlike the
+                    // webview channel the bus never errors, so keep reading
+                    // regardless of listener health.
+                    crate::events::emit(&app, &topic, line);
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -414,7 +415,8 @@ pub async fn claude_cli_spawn(
 
         let stderr_text = stderr_task.await.unwrap_or_default();
 
-        let _ = app.emit(
+        crate::events::emit(
+            &app,
             &done_topic,
             serde_json::json!({
                 "code": exit_code,

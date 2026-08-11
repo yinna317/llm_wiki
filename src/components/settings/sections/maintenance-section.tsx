@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
-import { invoke } from "@tauri-apps/api/core"
-import { open, save } from "@tauri-apps/plugin-dialog"
+import { invoke } from "@/lib/tauri-core"
+import { open, save } from "@/lib/tauri-dialog"
 import {
   Wrench,
   Loader2,
@@ -129,7 +129,7 @@ export function MaintenanceSection() {
   const handleImportProject = useCallback(async () => {
     const archive = await open({ multiple: false, filters: [{ name: "LLM Wiki project", extensions: ["zip"] }] })
     if (!archive || Array.isArray(archive)) return
-    const destination = await open({ directory: true, multiple: false, createDirectories: true })
+    const destination = await open({ directory: true, multiple: false, canCreateDirectories: true })
     if (!destination || Array.isArray(destination)) return
     setProjectToolBusy(true)
     try {

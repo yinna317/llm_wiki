@@ -11,7 +11,7 @@ use std::time::Duration;
 use md5::{Digest, Md5};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 use walkdir::WalkDir;
 
 use crate::panic_guard::run_guarded;
@@ -1228,7 +1228,7 @@ fn emit_queue(app: &AppHandle, project_id: &str, queue: &FileChangeQueue) {
         project_id: project_id.to_string(),
         tasks: queue.tasks.clone(),
     };
-    let _ = app.emit(EVENT_QUEUE_UPDATED, payload);
+    crate::events::emit(app, EVENT_QUEUE_UPDATED, payload);
 }
 
 fn emit_changed_batch(app: &AppHandle, project_id: &str, tasks: Vec<FileChangeTask>) {
@@ -1239,7 +1239,7 @@ fn emit_changed_batch(app: &AppHandle, project_id: &str, tasks: Vec<FileChangeTa
         project_id: project_id.to_string(),
         tasks,
     };
-    let _ = app.emit(EVENT_CHANGED, payload);
+    crate::events::emit(app, EVENT_CHANGED, payload);
 }
 
 fn ensure_sync_dir(root: &Path) -> Result<(), String> {

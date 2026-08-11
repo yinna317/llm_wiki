@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { ChevronRight, ChevronDown, File, Folder, FolderOpen } from "lucide-react"
-import { message } from "@tauri-apps/plugin-dialog"
+import { message } from "@/lib/tauri-dialog"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
 import type { FileNode } from "@/types/wiki"

@@ -35,6 +35,14 @@ tauri-plugin-store = "2.4.2"
 tauri-plugin-http = { version = "2", features = ["unsafe-headers"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 tiny_http = "0.12"
+# Browser-mode UI server (serve subcommand): axum hosts the API, SSE event
+# streams, static frontend assets and the /cmd invoke bridge. Runs on the
+# Tokio runtime Tauri already provides.
+axum = { version = "0.8", features = ["macros"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+mime_guess = "2"
+# `open` launches the user's default browser at the served UI URL.
+open = "5"
 zip = "2"
 calamine = "0.34.0"
 docx-rs = "0.4.20"
@@ -48,7 +56,7 @@ futures = "0.3"
 # Claude Code CLI subprocess transport: spawn `claude` as a child process,
 # stream stdout line-by-line back to the frontend. tokio::process gives us
 # async io and clean cancellation; `which` locates the binary on PATH.
-tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt"] }
+tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt", "net", "time", "fs", "signal"] }
 which = "7"
 uuid = { version = "1", features = ["v4"] }
 # Multimodal image extraction (Phase 1):
@@ -83,3 +91,4 @@ opt-level = "s"
 # larger binary, but prevents single-file corruption from killing the app.
 panic = "unwind"
 strip = true
+

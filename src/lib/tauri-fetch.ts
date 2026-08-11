@@ -19,8 +19,44 @@
 
 import { useWikiStore } from "@/stores/wiki-store"
 import { isProxyActive, type ProxyConfig } from "@/lib/proxy-config"
+import { apiServerBaseUrl, tokenQuery, useTauriTransport } from "@/lib/platform"
 
 let pluginFetchPromise: Promise<typeof globalThis.fetch> | null = null
+
+/**
+ * Browser-mode fetch: POST the request description to `/api/v1/http-proxy`
+ * and stream the upstream response back. The proxy endpoint mirrors the
+ * upstream status code and content-type, and the body streams, so SSE-style
+ * LLM responses behave the same as the plugin path.
+ */
+function headersToRecord(headers: HeadersInit | undefined): Record<string, string> {
+  if (!headers) return {}
+  if (headers instanceof Headers) return Object.fromEntries(headers.entries())
+  if (Array.isArray(headers)) return Object.fromEntries(headers)
+  return { ...headers }
+}
+
+const browserProxyFetch: typeof globalThis.fetch = async (input, init) => {
+  const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+  const body = init?.body
+  if (body != null && typeof body !== "string") {
+    throw new Error("browser-mode http proxy only supports string request bodies")
+  }
+  const danger = (init as PluginRequestInit | undefined)?.danger
+  const response = await globalThis.fetch(`${apiServerBaseUrl()}/http-proxy?${tokenQuery()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      url,
+      method: init?.method ?? "GET",
+      headers: headersToRecord(init?.headers),
+      body: body ?? undefined,
+      dangerAcceptInvalidCerts: danger?.acceptInvalidCerts === true ? true : undefined,
+    }),
+    signal: init?.signal ?? null,
+  })
+  return response
+}
 
 /**
  * True when running outside a browser / webview (vitest, SSR, any
@@ -65,7 +101,11 @@ export function withProxyTlsSettings(
  */
 export function getHttpFetch(): Promise<typeof globalThis.fetch> {
   if (!pluginFetchPromise) {
-    if (isNodeEnv) {
+    if (!useTauriTransport) {
+      // Browser mode (llm-wiki serve): no plugin runtime — proxy through
+      // the Rust server so CORS-rejecting providers still work.
+      pluginFetchPromise = Promise.resolve(browserProxyFetch)
+    } else if (isNodeEnv) {
       // Bind so `this === globalThis` — Node's fetch requires it.
       pluginFetchPromise = Promise.resolve(globalThis.fetch.bind(globalThis))
     } else {

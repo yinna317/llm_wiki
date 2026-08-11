@@ -1,19 +1,22 @@
 mod agent;
 mod api_server;
 mod clip_server;
+mod cmd_bridge;
 mod commands;
 mod cors;
+mod events;
 mod panic_guard;
 mod proxy;
 mod server_bind;
 mod tray;
 mod types;
+mod ui_routes;
 
 use panic_guard::run_guarded;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Mutex;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use uuid::Uuid;
 
 struct CloseBehaviorState(Mutex<String>);
@@ -208,7 +211,8 @@ async fn agent_start_turn_stream(
         let emit_session = session_for_task.clone();
         let emit_run = run_for_task.clone();
         let sink: agent::runtime::AgentEventSink = std::sync::Arc::new(move |event| {
-            let _ = emit_app.emit(
+            events::emit(
+                &emit_app,
                 "agent-event",
                 serde_json::json!({
                     "sessionId": emit_session.clone(),
@@ -238,7 +242,8 @@ async fn agent_start_turn_stream(
                 }
             }
             Err(err) => {
-                let _ = app_for_task.emit(
+                events::emit(
+                    &app_for_task,
                     "agent-event",
                     serde_json::json!({
                         "sessionId": session_for_task,
@@ -544,9 +549,95 @@ fn tray_available<R: tauri::Runtime>(window: &tauri::Window<R>) -> bool {
         .unwrap_or(false)
 }
 
+/// Parsed `llm-wiki serve [--port N] [--no-open]` arguments. In serve mode
+/// the app starts windowless: the API server additionally hosts the built
+/// frontend, and the user's browser is pointed at it with a per-run session
+/// token.
+#[derive(Clone, Default)]
+struct ServeArgs {
+    enabled: bool,
+    port: Option<u16>,
+    no_open: bool,
+}
+
+fn parse_serve_args() -> ServeArgs {
+    let mut args = std::env::args().skip(1);
+    let mut parsed = ServeArgs::default();
+    let Some(first) = args.next() else {
+        return parsed;
+    };
+    if first != "serve" {
+        return parsed;
+    }
+    parsed.enabled = true;
+    while let Some(arg) = args.next() {
+        if arg == "--no-open" {
+            parsed.no_open = true;
+        } else if let Some(port) = arg.strip_prefix("--port=") {
+            parsed.port = port.parse().ok();
+        } else if arg == "--port" {
+            parsed.port = args.next().and_then(|value| value.parse().ok());
+        }
+    }
+    parsed
+}
+
+/// Locate the built frontend to host in serve mode. Resolution order:
+/// `LLM_WIKI_FRONTEND_DIR` env, a `frontend/` dir next to the executable
+/// (packaged layout), then the dev `dist/` build output.
+fn resolve_frontend_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("LLM_WIKI_FRONTEND_DIR") {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("frontend");
+            if candidate.join("index.html").exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist");
+    if dev.join("index.html").exists() {
+        return Some(dev);
+    }
+    None
+}
+
+/// Wait for the API server to finish binding, then report the URL (and open
+/// it in the default browser unless `--no-open`). The session token rides in
+/// the URL because EventSource and <img> cannot set auth headers.
+fn report_serve_url_when_ready(token: String, no_open: bool) {
+    std::thread::spawn(move || {
+        for _ in 0..150 {
+            let port = api_server::bound_api_port();
+            if port != 0 {
+                let url = format!("http://127.0.0.1:{port}/?token={token}");
+                eprintln!("[serve] UI ready at {url}");
+                if !no_open {
+                    if let Err(err) = open::that(&url) {
+                        eprintln!("[serve] failed to open browser: {err}");
+                    }
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        eprintln!("[serve] API server did not come up within 15s; UI not opened");
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    apply_linux_webkit_compat_env();
+    let serve = parse_serve_args();
+    if !serve.enabled {
+        apply_linux_webkit_compat_env();
+    }
+    let mut context = tauri::generate_context!();
+    if serve.enabled {
+        // Windowless: the UI is served over HTTP and opened in a browser.
+        context.config_mut().app.windows.clear();
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -561,7 +652,7 @@ pub fn run() {
         // Ark's api/coding/v3, etc.) still work. Requests leave the app
         // from Rust, never the webview.
         .plugin(tauri_plugin_http::init())
-        .setup(|app| {
+        .setup(move |app| {
             // Let the PDF extractor find the bundled pdfium dynamic
             // library via Tauri's platform-correct resource path.
             if let Ok(dir) = app.path().resource_dir() {
@@ -599,12 +690,42 @@ pub fn run() {
             // Start the API before optional desktop integrations so the
             // backend is reachable if tray setup or another integration fails.
             clip_server::start_clip_server(app.handle().clone());
-            api_server::start_api_server(app.handle().clone());
-            let tray_available = match tray::create_tray(app.handle()) {
-                Ok(()) => true,
-                Err(err) => {
-                    eprintln!("[tray] system tray unavailable, continuing without it: {err}");
-                    false
+            if serve.enabled {
+                if let Some(port) = serve.port {
+                    api_server::set_api_port_override(port);
+                }
+                match resolve_frontend_dir() {
+                    Some(frontend_dir) => {
+                        let token = Uuid::new_v4().to_string();
+                        eprintln!(
+                            "[serve] hosting frontend from {}",
+                            frontend_dir.display()
+                        );
+                        api_server::enable_ui_mode(token.clone(), frontend_dir);
+                        api_server::start_api_server(app.handle().clone());
+                        report_serve_url_when_ready(token, serve.no_open);
+                    }
+                    None => {
+                        eprintln!(
+                            "[serve] no built frontend found (set LLM_WIKI_FRONTEND_DIR); \
+                             running API-only on the configured port"
+                        );
+                        api_server::start_api_server(app.handle().clone());
+                    }
+                }
+            } else {
+                api_server::start_api_server(app.handle().clone());
+            }
+            let tray_available = if serve.enabled {
+                // No window and no tray in serve mode: the browser tab is the UI.
+                false
+            } else {
+                match tray::create_tray(app.handle()) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        eprintln!("[tray] system tray unavailable, continuing without it: {err}");
+                        false
+                    }
                 }
             };
             match app.state::<TrayAvailabilityState>().0.lock() {
@@ -741,7 +862,7 @@ pub fn run() {
                 }
             }
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application")
         .run(|app, event| {
             #[cfg(target_os = "macos")]

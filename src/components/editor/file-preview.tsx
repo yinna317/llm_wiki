@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import { convertFileSrc } from "@tauri-apps/api/core"
-import { openPath } from "@tauri-apps/plugin-opener"
+import { convertFileSrc } from "@/lib/tauri-core"
+import { openPath } from "@/lib/tauri-opener"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"

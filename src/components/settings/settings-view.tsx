@@ -17,8 +17,8 @@ import {
   FileText,
 } from "lucide-react"
 import { useTranslation } from "react-i18next"
-import { invoke } from "@tauri-apps/api/core"
-import { disable as disableAutostart, enable as enableAutostart } from "@tauri-apps/plugin-autostart"
+import { invoke } from "@/lib/tauri-core"
+import { disable as disableAutostart, enable as enableAutostart } from "@/lib/tauri-autostart"
 import i18n from "@/i18n"
 import { Button } from "@/components/ui/button"
 import { useWikiStore } from "@/stores/wiki-store"

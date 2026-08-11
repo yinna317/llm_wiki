@@ -1,28 +1,33 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::atomic::{AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use futures::FutureExt;
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::response::Response;
+use axum::routing::{get, post};
+use axum::Router;
+use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Manager};
-use tiny_http::{Header, Method, Response, Server, StatusCode};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-use crate::cors::{local_cors_headers, request_origin};
-use crate::{agent, clip_server, commands, server_bind};
+use crate::cors::{cors_header_pairs, origin_from_header_map};
+use crate::{agent, clip_server, commands, server_bind, ui_routes};
 
 const PORT: u16 = 19828;
 const API_PREFIX: &str = "/api/v1";
-const MAX_BODY_BYTES: usize = 1024 * 1024;
-const MAX_CHAT_BODY_BYTES: usize = 40 * 1024 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_CHAT_BODY_BYTES: usize = 40 * 1024 * 1024;
 const MAX_FILE_CONTENT_BYTES: u64 = 2 * 1024 * 1024;
 const DEFAULT_MAX_FILES: usize = 2_000;
 const HARD_MAX_FILES: usize = 10_000;
@@ -69,65 +74,150 @@ pub fn invalidate_config_cache() {
     }
 }
 
+/// Browser-mode (`llm-wiki serve`) configuration. When set, the server also
+/// hosts the static frontend, the `/cmd` invoke bridge, the `/events` SSE
+/// stream and friends, and probes neighbouring ports on bind conflicts so a
+/// `serve` instance can coexist with the desktop app.
+#[derive(Clone)]
+pub struct UiMode {
+    pub session_token: String,
+    pub frontend_dir: PathBuf,
+}
+
+static PORT_OVERRIDE: OnceLock<u16> = OnceLock::new();
+static BOUND_PORT: AtomicU16 = AtomicU16::new(0);
+static UI_MODE: OnceLock<UiMode> = OnceLock::new();
+
+const PORT_PROBE_SPAN: u16 = 9;
+
+pub fn enable_ui_mode(session_token: String, frontend_dir: PathBuf) {
+    let _ = UI_MODE.set(UiMode {
+        session_token,
+        frontend_dir,
+    });
+}
+
+pub fn ui_mode() -> Option<&'static UiMode> {
+    UI_MODE.get()
+}
+
+pub fn set_api_port_override(port: u16) {
+    let _ = PORT_OVERRIDE.set(port);
+}
+
+fn api_port() -> u16 {
+    PORT_OVERRIDE.get().copied().unwrap_or(PORT)
+}
+
+/// Port the server actually bound — differs from `api_port()` when UI mode
+/// probed past a conflict. 0 while still starting.
+pub fn bound_api_port() -> u16 {
+    BOUND_PORT.load(Ordering::Relaxed)
+}
+
+pub fn ui_session_token() -> Option<&'static str> {
+    ui_mode().map(|mode| mode.session_token.as_str())
+}
+
+#[derive(Clone)]
+pub(crate) struct ApiState {
+    pub(crate) app: AppHandle,
+}
+
 pub fn start_api_server(app: AppHandle) {
-    thread::spawn(move || loop {
+    thread::spawn(move || {
+        tauri::async_runtime::block_on(serve_loop(app));
+    });
+}
+
+async fn serve_loop(app: AppHandle) {
+    loop {
         API_STATUS.store(0, Ordering::Relaxed);
-        let (server, addr) = match bind_server_with_retry(&app) {
-            Some(bound) => bound,
-            None => {
-                API_STATUS.store(2, Ordering::Relaxed);
-                thread::sleep(Duration::from_secs(BIND_RETRY_DELAY_SECS));
-                continue;
-            }
+        let Some((listener, addr, port)) = bind_listener_with_retry(&app).await else {
+            API_STATUS.store(2, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(BIND_RETRY_DELAY_SECS)).await;
+            continue;
         };
 
         API_STATUS.store(1, Ordering::Relaxed);
+        BOUND_PORT.store(port, Ordering::Relaxed);
         eprintln!("[API Server] Listening on http://{addr}{API_PREFIX}");
 
-        for request in server.incoming_requests() {
-            let method = request.method().clone();
-            let url = request.url().to_string();
-            let origin = request_origin(&request);
-            if should_rate_limit(&method, &url) && !allow_request() {
-                respond_error(request, 429, "Too many requests", origin.as_deref());
-                continue;
-            }
-            let Some(slot) = try_acquire_request_slot() else {
-                respond_error(request, 503, "API server is busy", origin.as_deref());
-                continue;
-            };
-            let app = app.clone();
-            thread::spawn(move || {
-                let _slot = slot;
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    process_request(app, request);
-                }));
-                if let Err(payload) = result {
-                    eprintln!("[API Server] request handler panicked: {payload:?}");
-                }
-            });
+        let router = build_router(ApiState { app: app.clone() });
+        let result = axum::serve(listener, router.into_make_service()).await;
+        if let Err(err) = result {
+            eprintln!("[API Server] server error: {err}");
         }
 
         API_STATUS.store(3, Ordering::Relaxed);
         eprintln!("[API Server] server loop exited; restarting");
-        thread::sleep(Duration::from_secs(BIND_RETRY_DELAY_SECS));
-    });
+        tokio::time::sleep(Duration::from_secs(BIND_RETRY_DELAY_SECS)).await;
+    }
 }
 
-fn bind_server_with_retry(app: &AppHandle) -> Option<(Server, String)> {
+fn build_router(state: ApiState) -> Router {
+    Router::new()
+        .route(
+            "/api/v1/events",
+            get(ui_routes::events_sse).options(cors_preflight),
+        )
+        .route(
+            "/api/v1/cmd/{name}",
+            post(ui_routes::cmd_bridge).options(cors_preflight),
+        )
+        .route(
+            "/api/v1/app-state",
+            get(ui_routes::get_app_state)
+                .put(ui_routes::put_app_state)
+                .options(cors_preflight),
+        )
+        .route(
+            "/api/v1/files/raw",
+            get(ui_routes::file_raw).options(cors_preflight),
+        )
+        .route(
+            "/api/v1/http-proxy",
+            post(ui_routes::http_proxy).options(cors_preflight),
+        )
+        .route("/api/v1/ui-info", get(ui_routes::ui_info))
+        .fallback(fallback_handler)
+        .with_state(state)
+}
+
+/// CORS preflight for the explicit UI routes — axum answers method-mismatched
+/// requests on a registered route with 405 rather than falling through to the
+/// fallback, so OPTIONS has to be handled on each route directly.
+async fn cors_preflight(request: Request) -> Response {
+    let origin = origin_from_header_map(request.headers());
+    options_response(origin.as_deref())
+}
+
+async fn bind_listener_with_retry(
+    app: &AppHandle,
+) -> Option<(tokio::net::TcpListener, String, u16)> {
     let host = server_bind::configured_bind_host(app);
-    let addr = server_bind::bind_addr(&host, PORT);
+    let base_port = api_port();
+    // UI mode probes a short range so a `serve` instance still comes up when
+    // the desktop app already owns the default port.
+    let candidates: Vec<u16> = if ui_mode().is_some() {
+        (base_port..=base_port.saturating_add(PORT_PROBE_SPAN)).collect()
+    } else {
+        vec![base_port]
+    };
     for attempt in 1..=MAX_BIND_RETRIES {
-        match Server::http(&addr) {
-            Ok(server) => return Some((server, addr)),
-            Err(err) => {
-                eprintln!(
-                    "[API Server] Failed to bind {addr} (attempt {attempt}/{MAX_BIND_RETRIES}): {err}"
-                );
-                if attempt < MAX_BIND_RETRIES {
-                    thread::sleep(Duration::from_secs(BIND_RETRY_DELAY_SECS));
+        for &port in &candidates {
+            let addr = server_bind::bind_addr(&host, port);
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => return Some((listener, addr, port)),
+                Err(err) => {
+                    eprintln!(
+                        "[API Server] Failed to bind {addr} (attempt {attempt}/{MAX_BIND_RETRIES}): {err}"
+                    );
                 }
             }
+        }
+        if attempt < MAX_BIND_RETRIES {
+            tokio::time::sleep(Duration::from_secs(BIND_RETRY_DELAY_SECS)).await;
         }
     }
     None
@@ -185,83 +275,117 @@ fn try_acquire_request_slot() -> Option<RequestSlot> {
     }
 }
 
-fn process_request(app: AppHandle, mut request: tiny_http::Request) {
+/// Axum fallback: handles every `/api/v1/**` route not claimed by the UI
+/// endpoints above, replicating the tiny_http `process_request` pipeline —
+/// OPTIONS short-circuit, rate limit, in-flight slot, body limit, streaming
+/// chat detection, then `handle_request`. Non-API GET paths fall through to
+/// static frontend hosting in UI mode.
+async fn fallback_handler(State(state): State<ApiState>, request: Request) -> Response {
+    let app = state.app.clone();
     let method = request.method().clone();
-    let url = request.url().to_string();
-    let origin = request_origin(&request);
-    if method == Method::Options {
-        respond_options(request, origin.as_deref());
-        return;
+    let url = request_url(&request);
+    let origin = origin_from_header_map(request.headers());
+    let (path, _) = split_url(&url);
+
+    if !path.starts_with(API_PREFIX) && path != "/health" {
+        if let Some(mode) = ui_mode() {
+            if matches!(method, Method::GET | Method::HEAD) {
+                return ui_routes::serve_static(mode, &path).await;
+            }
+        }
     }
 
-    let headers: Vec<(String, String)> = request
-        .headers()
-        .iter()
-        .map(|header| {
-            (
-                header.field.as_str().to_ascii_lowercase().to_string(),
-                header.value.as_str().to_string(),
-            )
-        })
-        .collect();
+    if method == Method::OPTIONS {
+        return options_response(origin.as_deref());
+    }
 
-    let body = match read_body(&mut request, body_limit_for_request(&method, &url)) {
+    if should_rate_limit(&method, &url) && !allow_request() {
+        return error_response(429, "Too many requests", origin.as_deref());
+    }
+    let Some(slot) = try_acquire_request_slot() else {
+        return error_response(503, "API server is busy", origin.as_deref());
+    };
+    let _slot = slot;
+
+    let headers: Vec<(String, String)> = lowercased_headers(request.headers());
+
+    let body = match read_body(request.into_body(), body_limit_for_request(&method, &url)).await {
         Ok(body) => body,
         Err(err) => {
-            respond_error(request, 400, &err, origin.as_deref());
-            return;
+            return error_response(400, &err, origin.as_deref());
         }
     };
 
     let (path, query) = split_url(&url);
     if wants_streaming_chat(&method, &path, &body, &headers) {
         if !api_enabled(&app) {
-            respond_error(
-                request,
+            return error_response(
                 503,
                 "API server is disabled in Settings → API Server",
                 origin.as_deref(),
             );
-            return;
         }
         // Agent chat remains token-protected even when read-oriented API
         // endpoints are configured for unauthenticated local access.
         if !is_token_authorized(&app, query, &headers) {
-            respond_error(request, 401, "Unauthorized", origin.as_deref());
-            return;
+            return error_response(401, "Unauthorized", origin.as_deref());
         }
         let Some(project_id) = chat_project_id(&method, &path) else {
-            respond_error(request, 404, "Not found", origin.as_deref());
-            return;
+            return error_response(404, "Not found", origin.as_deref());
         };
         let Some(stream_slot) = try_acquire_chat_stream_slot() else {
-            respond_error(
-                request,
+            return error_response(
                 503,
                 "Too many concurrent Agent chat streams",
                 origin.as_deref(),
             );
-            return;
         };
-        respond_chat_sse(
-            request,
-            app,
-            project_id,
-            &body,
-            origin.as_deref(),
-            stream_slot,
-        );
-        return;
+        return chat_sse_response(app, project_id, &body, origin.as_deref(), stream_slot);
     }
 
-    let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        handle_request(&app, &method, &url, &body, &headers)
-    }))
-    .unwrap_or_else(|payload| {
-        eprintln!("[API Server] request panicked: {payload:?}");
-        err(500, "Internal API server error")
-    });
-    respond_json(request, response.status, response.body, origin.as_deref());
+    // handle_request is sync and internally block_ons (search, non-streaming
+    // chat), which panics on a Tokio worker thread. Run it on the blocking
+    // pool — this also keeps heavy file walks off the async workers.
+    let blocking_app = app.clone();
+    let blocking_method = method.clone();
+    let response = match tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_request(&blocking_app, &blocking_method, &url, &body, &headers)
+        }))
+    })
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(payload)) => {
+            eprintln!("[API Server] request panicked: {payload:?}");
+            err(500, "Internal API server error")
+        }
+        Err(join_err) => {
+            eprintln!("[API Server] blocking handler failed: {join_err}");
+            err(500, "Internal API server error")
+        }
+    };
+    json_response(response.status, response.body, origin.as_deref())
+}
+
+pub(crate) fn request_url(request: &Request) -> String {
+    request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string())
+}
+
+pub(crate) fn lowercased_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_ascii_lowercase(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
 }
 
 struct ApiResponse {
@@ -329,7 +453,7 @@ fn handle_request(
     if !is_authorized(app, query, headers) {
         return err(401, "Unauthorized");
     }
-    if !matches!(method, &Method::Get | &Method::Post | &Method::Patch) {
+    if !matches!(method, &Method::GET | &Method::POST | &Method::PATCH) {
         return err(405, "Method not allowed");
     }
 
@@ -338,27 +462,27 @@ fn handle_request(
     };
 
     match (method, parts.as_slice()) {
-        (&Method::Get, ["projects"]) => handle_projects(app),
-        (&Method::Get, ["projects", project_id, "files"]) => handle_files(app, project_id, query),
-        (&Method::Get, ["projects", project_id, "files", "content"]) => {
+        (&Method::GET, ["projects"]) => handle_projects(app),
+        (&Method::GET, ["projects", project_id, "files"]) => handle_files(app, project_id, query),
+        (&Method::GET, ["projects", project_id, "files", "content"]) => {
             handle_file_content(app, project_id, query)
         }
-        (&Method::Get, ["projects", project_id, "reviews"]) => {
+        (&Method::GET, ["projects", project_id, "reviews"]) => {
             handle_reviews(app, project_id, query)
         }
-        (&Method::Post, ["projects", project_id, "reviews", "resolve"]) => {
+        (&Method::POST, ["projects", project_id, "reviews", "resolve"]) => {
             handle_bulk_resolve_reviews(app, project_id, body)
         }
-        (&Method::Patch, ["projects", project_id, "reviews", review_id]) => {
+        (&Method::PATCH, ["projects", project_id, "reviews", review_id]) => {
             handle_patch_review(app, project_id, review_id, body)
         }
-        (&Method::Post, ["projects", project_id, "search"]) => handle_search(app, project_id, body),
-        (&Method::Get, ["projects", project_id, "graph"]) => handle_graph(app, project_id, query),
-        (&Method::Post, ["projects", project_id, "sources", "rescan"]) => {
+        (&Method::POST, ["projects", project_id, "search"]) => handle_search(app, project_id, body),
+        (&Method::GET, ["projects", project_id, "graph"]) => handle_graph(app, project_id, query),
+        (&Method::POST, ["projects", project_id, "sources", "rescan"]) => {
             handle_rescan(app, project_id)
         }
-        (&Method::Post, ["projects", project_id, "chat"]) => handle_chat(app, project_id, body),
-        (&Method::Post, ["projects", project_id, "chat", session_id, "cancel"]) => {
+        (&Method::POST, ["projects", project_id, "chat"]) => handle_chat(app, project_id, body),
+        (&Method::POST, ["projects", project_id, "chat", session_id, "cancel"]) => {
             handle_cancel_chat(app, project_id, session_id)
         }
         _ => err(404, "Not found"),
@@ -366,7 +490,7 @@ fn handle_request(
 }
 
 fn should_rate_limit(method: &Method, url: &str) -> bool {
-    if method == &Method::Options {
+    if method == &Method::OPTIONS {
         return false;
     }
     let (path, _) = split_url(url);
@@ -394,7 +518,7 @@ fn is_agent_chat_request(method: &Method, path: &str) -> bool {
     let Some(parts) = api_path_parts(path) else {
         return false;
     };
-    method == &Method::Post
+    method == &Method::POST
         && matches!(
             parts.as_slice(),
             ["projects", _, "chat"] | ["projects", _, "chat", _, "cancel"]
@@ -402,7 +526,7 @@ fn is_agent_chat_request(method: &Method, path: &str) -> bool {
 }
 
 fn chat_project_id<'a>(method: &Method, path: &'a str) -> Option<&'a str> {
-    if method != &Method::Post {
+    if method != &Method::POST {
         return None;
     }
     let parts = api_path_parts(path)?;
@@ -454,7 +578,7 @@ fn wants_streaming_chat(
 fn body_limit_for_request(method: &Method, url: &str) -> usize {
     let (path, _) = split_url(url);
     let parts = api_path_parts(&path);
-    if method == &Method::Post
+    if method == &Method::POST
         && parts
             .as_deref()
             .map(|parts| matches!(parts, ["projects", _, "chat"]))
@@ -466,46 +590,60 @@ fn body_limit_for_request(method: &Method, url: &str) -> usize {
     }
 }
 
-fn read_body(request: &mut tiny_http::Request, max_body_bytes: usize) -> Result<String, String> {
-    let mut limited = request.as_reader().take(max_body_bytes as u64 + 1);
-    let mut bytes = Vec::new();
-    limited
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("Failed to read body: {e}"))?;
+pub(crate) async fn read_body(body: Body, max_body_bytes: usize) -> Result<String, String> {
+    // to_bytes with a limit fails fast once the body exceeds the cap instead
+    // of buffering an unbounded upload.
+    let bytes = axum::body::to_bytes(body, max_body_bytes + 1)
+        .await
+        .map_err(|err| format!("Failed to read body: {err}"))?;
     if bytes.len() > max_body_bytes {
         return Err("Request body too large".to_string());
     }
-    String::from_utf8(bytes).map_err(|_| "Request body must be UTF-8".to_string())
+    String::from_utf8(bytes.to_vec()).map_err(|_| "Request body must be UTF-8".to_string())
 }
 
-fn respond_error(request: tiny_http::Request, status: u16, message: &str, origin: Option<&str>) {
-    respond_json(
-        request,
-        status,
-        json!({ "ok": false, "error": message }),
-        origin,
-    );
+pub(crate) fn error_response(status: u16, message: &str, origin: Option<&str>) -> Response {
+    json_response(status, json!({ "ok": false, "error": message }), origin)
 }
 
-fn respond_options(request: tiny_http::Request, origin: Option<&str>) {
-    let mut response = Response::empty(StatusCode(204));
-    for header in cors_headers(origin) {
-        response.add_header(header);
+fn options_response(origin: Option<&str>) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    apply_cors(response.headers_mut(), origin, true);
+    if let Ok(value) = "600".parse() {
+        response
+            .headers_mut()
+            .insert(axum::http::header::ACCESS_CONTROL_MAX_AGE, value);
     }
-    response.add_header(Header::from_bytes("Access-Control-Max-Age", "600").unwrap());
-    let _ = request.respond(response);
+    response
 }
 
-fn respond_json(request: tiny_http::Request, status: u16, body: Value, origin: Option<&str>) {
-    let mut response = Response::from_string(body.to_string()).with_status_code(StatusCode(status));
-    for header in cors_headers(origin) {
-        response.add_header(header);
+pub(crate) fn json_response(status: u16, body: Value, origin: Option<&str>) -> Response {
+    let mut response = Response::new(Body::from(body.to_string()));
+    *response.status_mut() =
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    apply_cors(response.headers_mut(), origin, true);
+    response
+}
+
+const CORS_ALLOW_HEADERS: &str = "Content-Type, Authorization, X-LLM-Wiki-Token";
+
+/// Apply the shared CORS policy to an axum response. `set_content_type` is
+/// false for SSE responses, whose own `text/event-stream` content type must
+/// win over the JSON default baked into `cors_header_pairs`.
+pub(crate) fn apply_cors(headers: &mut HeaderMap, origin: Option<&str>, set_content_type: bool) {
+    for (name, value) in cors_header_pairs(origin, CORS_ALLOW_HEADERS) {
+        if !set_content_type && name.eq_ignore_ascii_case("content-type") {
+            continue;
+        }
+        let Ok(name) = axum::http::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = axum::http::HeaderValue::from_str(&value) else {
+            continue;
+        };
+        headers.insert(name, value);
     }
-    let _ = request.respond(response);
-}
-
-fn cors_headers(origin: Option<&str>) -> Vec<Header> {
-    local_cors_headers(origin, "Content-Type, Authorization, X-LLM-Wiki-Token")
 }
 
 fn split_url(url: &str) -> (String, &str) {
@@ -554,9 +692,21 @@ pub(crate) fn is_token_authorized(
     query: &str,
     headers: &[(String, String)],
 ) -> bool {
+    // The serve-mode session token is accepted alongside the configured API
+    // token: the browser UI only knows the runtime token injected into its
+    // URL, while external clients keep using the configured one.
+    if let Some(session) = ui_session_token() {
+        if token_matches(query, headers, session) {
+            return true;
+        }
+    }
     let Some(token) = api_token(app) else {
         return false;
     };
+    token_matches(query, headers, &token)
+}
+
+fn token_matches(query: &str, headers: &[(String, String)], token: &str) -> bool {
     let params = parse_query(query);
     if params
         .get("token")
@@ -683,7 +833,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-fn load_app_state(app: &AppHandle) -> Option<Value> {
+pub(crate) fn load_app_state(app: &AppHandle) -> Option<Value> {
     let now = Instant::now();
     let lock = APP_STATE_CACHE.get_or_init(|| Mutex::new(None));
     let mut previous = None;
@@ -712,11 +862,30 @@ fn load_app_state(app: &AppHandle) -> Option<Value> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProjectEntry {
-    id: String,
-    name: String,
-    path: String,
+pub(crate) struct ProjectEntry {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) path: String,
     current: bool,
+}
+
+pub(crate) fn app_state_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_data_dir().ok().map(|dir| dir.join("app-state.json"))
+}
+
+/// Whether `path` sits inside any known project directory. Used by the
+/// browser-mode `/files/raw` endpoint as its read whitelist, mirroring the
+/// reach the asset protocol has in desktop mode.
+pub(crate) fn is_known_project_path(app: &AppHandle, path: &Path) -> bool {
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    load_projects(app).iter().any(|project| {
+        Path::new(&project.path)
+            .canonicalize()
+            .map(|root| canonical.starts_with(root))
+            .unwrap_or(false)
+    })
 }
 
 fn handle_projects(app: &AppHandle) -> ApiResponse {
@@ -729,7 +898,7 @@ fn handle_projects(app: &AppHandle) -> ApiResponse {
     }))
 }
 
-fn load_projects(app: &AppHandle) -> Vec<ProjectEntry> {
+pub(crate) fn load_projects(app: &AppHandle) -> Vec<ProjectEntry> {
     let current = normalize_path(&clip_server::current_project_path());
     let mut by_path: BTreeMap<String, ProjectEntry> = BTreeMap::new();
 
@@ -1928,38 +2097,6 @@ fn handle_chat(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
     }
 }
 
-struct SseReader {
-    receiver: Receiver<Vec<u8>>,
-    current: Cursor<Vec<u8>>,
-}
-
-impl SseReader {
-    fn new(receiver: Receiver<Vec<u8>>) -> Self {
-        Self {
-            receiver,
-            current: Cursor::new(Vec::new()),
-        }
-    }
-}
-
-impl Read for SseReader {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            let read = self.current.read(buffer)?;
-            if read > 0 {
-                return Ok(read);
-            }
-            match self.receiver.recv() {
-                Ok(chunk) => self.current = Cursor::new(chunk),
-                Err(_) => return Ok(0),
-            }
-        }
-    }
-}
-
 fn sse_frame(event: &str, data: &Value) -> Vec<u8> {
     format!("event: {event}\ndata: {}\n\n", data).into_bytes()
 }
@@ -1970,47 +2107,46 @@ enum SseSendResult {
     Disconnected,
 }
 
-fn try_send_sse(sender: &SyncSender<Vec<u8>>, frame: Vec<u8>) -> SseSendResult {
+type SseSender = mpsc::Sender<Vec<u8>>;
+
+fn try_send_sse(sender: &SseSender, frame: Vec<u8>) -> SseSendResult {
     match sender.try_send(frame) {
         Ok(()) => SseSendResult::Sent,
-        Err(mpsc::TrySendError::Full(_)) => SseSendResult::Full,
-        Err(mpsc::TrySendError::Disconnected(_)) => SseSendResult::Disconnected,
+        Err(mpsc::error::TrySendError::Full(_)) => SseSendResult::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => SseSendResult::Disconnected,
     }
 }
 
-fn send_terminal_sse(sender: SyncSender<Vec<u8>>, frame: Vec<u8>) {
+fn send_terminal_sse(sender: SseSender, frame: Vec<u8>) {
     // A terminal frame must not be dropped when the bounded queue is briefly
-    // full, but blocking a Tokio worker would stall unrelated app work. Use a
-    // short-lived writer thread; send unblocks when the socket drains or the
-    // request reader is dropped after a disconnect.
-    thread::spawn(move || {
-        let _ = sender.send(frame);
+    // full, but blocking the caller stalls unrelated work. A short-lived
+    // async task awaits capacity; it resolves when the socket drains or the
+    // receiver is dropped after a disconnect.
+    tauri::async_runtime::spawn(async move {
+        let _ = sender.send(frame).await;
     });
 }
 
-fn respond_chat_sse(
-    request: tiny_http::Request,
+fn chat_sse_response(
     app: AppHandle,
     project_id: &str,
     body: &str,
     origin: Option<&str>,
-    _stream_slot: ChatStreamSlot,
-) {
+    stream_slot: ChatStreamSlot,
+) -> Response {
     let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         prepare_chat(&app, project_id, body)
     }));
     let mut prepared = match prepared {
         Ok(Ok(prepared)) => prepared,
         Ok(Err(response)) => {
-            respond_json(request, response.status, response.body, origin);
-            return;
+            return json_response(response.status, response.body, origin);
         }
         Err(_) => {
-            respond_error(request, 500, "Internal API server error", origin);
-            return;
+            return error_response(500, "Internal API server error", origin);
         }
     };
-    let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(SSE_QUEUE_CAPACITY);
+    let (sender, receiver) = mpsc::channel::<Vec<u8>>(SSE_QUEUE_CAPACITY);
     let _ = try_send_sse(
         &sender,
         sse_frame(
@@ -2023,7 +2159,6 @@ fn respond_chat_sse(
         ),
     );
 
-    let (heartbeat_stop, heartbeat_done) = mpsc::channel::<()>();
     let heartbeat_sender = sender.clone();
     let heartbeat_registry = app
         .state::<agent::cancel::AgentCancellationRegistry>()
@@ -2032,27 +2167,33 @@ fn respond_chat_sse(
     let heartbeat_project = prepared.project.id.clone();
     let heartbeat_session = prepared.session_id.clone();
     let heartbeat_run = prepared.run_id.clone();
-    thread::spawn(move || loop {
-        match heartbeat_done.recv_timeout(SSE_HEARTBEAT_INTERVAL) {
-            Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                match try_send_sse(&heartbeat_sender, b": keepalive\n\n".to_vec()) {
-                    SseSendResult::Disconnected => {
-                        heartbeat_registry.cancel(
-                            &heartbeat_project,
-                            &heartbeat_session,
-                            Some(&heartbeat_run),
-                        );
-                        break;
-                    }
-                    SseSendResult::Sent | SseSendResult::Full => {}
+    let heartbeat_task = tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(SSE_HEARTBEAT_INTERVAL);
+        // The first tick fires immediately; skip it so keepalives land at a
+        // steady 10s cadence like the old recv_timeout loop.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match try_send_sse(&heartbeat_sender, b": keepalive\n\n".to_vec()) {
+                SseSendResult::Disconnected => {
+                    heartbeat_registry.cancel(
+                        &heartbeat_project,
+                        &heartbeat_session,
+                        Some(&heartbeat_run),
+                    );
+                    break;
                 }
+                SseSendResult::Sent | SseSendResult::Full => {}
             }
         }
     });
 
     let task_app = app.clone();
     tauri::async_runtime::spawn(async move {
+        // The concurrency slot lives until the stream terminates — the axum
+        // handler returns as soon as headers are sent, so it can't be held
+        // there the way the tiny_http version did.
+        let _stream_slot = stream_slot;
         let event_sender = sender.clone();
         let registry = task_app
             .state::<agent::cancel::AgentCancellationRegistry>()
@@ -2115,24 +2256,30 @@ fn respond_chat_sse(
                 );
             }
         }
-        let _ = heartbeat_stop.send(());
+        heartbeat_task.abort();
+        drop(sender);
     });
 
-    let mut response = Response::new(
-        StatusCode(200),
-        vec![
-            Header::from_bytes("Content-Type", "text/event-stream; charset=utf-8").unwrap(),
-            Header::from_bytes("Cache-Control", "no-cache, no-transform").unwrap(),
-            Header::from_bytes("X-Accel-Buffering", "no").unwrap(),
-        ],
-        SseReader::new(receiver),
-        None,
-        None,
+    // Frames are preformatted `event:/data:` blocks (including `: keepalive`
+    // comments), so stream them raw instead of re-wrapping in axum's Sse.
+    let stream = ReceiverStream::new(receiver).map(Ok::<Vec<u8>, std::io::Error>);
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/event-stream; charset=utf-8"),
     );
-    for header in cors_headers(origin) {
-        response.add_header(header);
-    }
-    let _ = request.respond(response);
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-accel-buffering"),
+        axum::http::HeaderValue::from_static("no"),
+    );
+    apply_cors(headers, origin, false);
+    response
 }
 
 fn handle_cancel_chat(app: &AppHandle, project_id: &str, session_id: &str) -> ApiResponse {
@@ -3053,11 +3200,11 @@ mod tests {
 
     #[test]
     fn rate_limit_skips_health_and_options_only() {
-        assert!(!should_rate_limit(&Method::Get, "/api/v1/health"));
-        assert!(!should_rate_limit(&Method::Options, "/api/v1/projects"));
-        assert!(should_rate_limit(&Method::Get, "/wp-login"));
+        assert!(!should_rate_limit(&Method::GET, "/api/v1/health"));
+        assert!(!should_rate_limit(&Method::OPTIONS, "/api/v1/projects"));
+        assert!(should_rate_limit(&Method::GET, "/wp-login"));
         assert!(should_rate_limit(
-            &Method::Post,
+            &Method::POST,
             "/api/v1/projects/current/search"
         ));
     }
@@ -3065,11 +3212,11 @@ mod tests {
     #[test]
     fn chat_endpoint_allows_larger_multimodal_bodies() {
         assert_eq!(
-            body_limit_for_request(&Method::Post, "/api/v1/projects/current/chat"),
+            body_limit_for_request(&Method::POST, "/api/v1/projects/current/chat"),
             MAX_CHAT_BODY_BYTES
         );
         assert_eq!(
-            body_limit_for_request(&Method::Post, "/api/v1/projects/current/search"),
+            body_limit_for_request(&Method::POST, "/api/v1/projects/current/search"),
             MAX_BODY_BYTES
         );
     }
@@ -3077,19 +3224,19 @@ mod tests {
     #[test]
     fn chat_routes_are_recognized_as_agent_requests() {
         assert!(is_agent_chat_request(
-            &Method::Post,
+            &Method::POST,
             "/api/v1/projects/current/chat"
         ));
         assert!(is_agent_chat_request(
-            &Method::Post,
+            &Method::POST,
             "/api/v1/projects/current/chat/session-1/cancel"
         ));
         assert!(!is_agent_chat_request(
-            &Method::Post,
+            &Method::POST,
             "/api/v1/projects/current/search"
         ));
         assert!(!is_agent_chat_request(
-            &Method::Get,
+            &Method::GET,
             "/api/v1/projects/current/chat"
         ));
     }
@@ -3098,13 +3245,13 @@ mod tests {
     fn chat_streaming_is_enabled_by_body_or_accept_header() {
         let path = "/api/v1/projects/current/chat";
         assert!(wants_streaming_chat(
-            &Method::Post,
+            &Method::POST,
             path,
             r#"{"message":"hello","stream":true}"#,
             &[],
         ));
         assert!(wants_streaming_chat(
-            &Method::Post,
+            &Method::POST,
             path,
             r#"{"message":"hello"}"#,
             &[(
@@ -3113,61 +3260,61 @@ mod tests {
             )],
         ));
         assert!(!wants_streaming_chat(
-            &Method::Post,
+            &Method::POST,
             path,
             r#"{"message":"hello","stream":false}"#,
             &[],
         ));
         assert!(!wants_streaming_chat(
-            &Method::Post,
+            &Method::POST,
             path,
             r#"{"message":"hello","stream":false}"#,
             &[("accept".to_string(), "text/event-stream".to_string())],
         ));
         assert!(!wants_streaming_chat(
-            &Method::Post,
+            &Method::POST,
             "/api/v1/projects/current/search",
             r#"{"stream":true}"#,
             &[],
         ));
         assert!(!wants_streaming_chat(
-            &Method::Post,
+            &Method::POST,
             "/api/v1/projects/current/chat/s1/cancel",
             r#"{"stream":true}"#,
             &[],
         ));
         assert!(!wants_streaming_chat(
-            &Method::Post,
+            &Method::POST,
             "/projects/current/chat",
             r#"{"stream":true}"#,
             &[],
         ));
         assert!(!wants_streaming_chat(
-            &Method::Post,
+            &Method::POST,
             "/api/v1/api/v1/projects/current/chat",
             r#"{"stream":true}"#,
             &[],
         ));
     }
 
-    #[test]
-    fn sse_reader_preserves_event_frames_until_sender_closes() {
-        let (sender, receiver) = mpsc::sync_channel(4);
+    #[tokio::test]
+    async fn sse_frames_stream_in_order_until_sender_closes() {
+        let (sender, receiver) = mpsc::channel(4);
         sender
             .send(sse_frame("meta", &json!({ "sessionId": "s1" })))
+            .await
             .unwrap();
         sender
             .send(sse_frame(
                 "agent",
                 &json!({ "type": "messageDelta", "text": "Hi" }),
             ))
+            .await
             .unwrap();
         drop(sender);
 
-        let mut body = String::new();
-        let mut reader = SseReader::new(receiver);
-        assert_eq!(reader.read(&mut []).unwrap(), 0);
-        reader.read_to_string(&mut body).unwrap();
+        let frames: Vec<Vec<u8>> = ReceiverStream::new(receiver).collect().await;
+        let body = String::from_utf8(frames.concat()).unwrap();
         assert!(body.contains("event: meta\n"));
         assert!(body.contains(r#"data: {"sessionId":"s1"}"#));
         assert!(body.contains("event: agent\n"));
@@ -3176,7 +3323,7 @@ mod tests {
 
     #[test]
     fn sse_queue_rejects_backpressure_without_blocking_runtime_threads() {
-        let (sender, _receiver) = mpsc::sync_channel(1);
+        let (sender, _receiver) = mpsc::channel(1);
         assert!(matches!(
             try_send_sse(&sender, b"first".to_vec()),
             SseSendResult::Sent
@@ -3189,7 +3336,7 @@ mod tests {
 
     #[test]
     fn sse_queue_reports_disconnected_clients() {
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>(1);
         drop(receiver);
         assert!(matches!(
             try_send_sse(&sender, b"event".to_vec()),
@@ -3197,14 +3344,14 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn terminal_sse_waits_for_queue_capacity() {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        sender.send(b"agent".to_vec()).unwrap();
+    #[tokio::test]
+    async fn terminal_sse_waits_for_queue_capacity() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(b"agent".to_vec()).await.unwrap();
         send_terminal_sse(sender, b"done".to_vec());
 
-        assert_eq!(receiver.recv().unwrap(), b"agent");
-        assert_eq!(receiver.recv().unwrap(), b"done");
+        assert_eq!(receiver.recv().await.unwrap(), b"agent");
+        assert_eq!(receiver.recv().await.unwrap(), b"done");
     }
 
     #[test]

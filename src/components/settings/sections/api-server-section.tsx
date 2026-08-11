@@ -9,7 +9,7 @@ import {
   ShieldAlert,
 } from "lucide-react"
 import { useTranslation } from "react-i18next"
-import { openUrl } from "@tauri-apps/plugin-opener"
+import { openUrl } from "@/lib/tauri-opener"
 import { apiServerStatus, mcpServerEntryPath } from "@/commands/fs"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"

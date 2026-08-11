@@ -1,4 +1,17 @@
-use tiny_http::Header;
+/// Shared CORS policy for the local HTTP servers.
+///
+/// Two server stacks consume this module:
+///   - the legacy clip server (tiny_http) — `local_cors_headers` /
+///     `request_origin` keep their tiny_http signatures;
+///   - the axum API/UI server — `cors_header_pairs` /
+///     `origin_from_header_map` work on `http` crate types.
+///
+/// The policy itself (which origins may talk to us) lives in
+/// `is_allowed_browser_origin` and is deliberately shared so both servers
+/// expose exactly the same surface.
+use axum::http::HeaderMap;
+
+const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, OPTIONS";
 
 pub fn request_origin(request: &tiny_http::Request) -> Option<String> {
     request
@@ -6,6 +19,13 @@ pub fn request_origin(request: &tiny_http::Request) -> Option<String> {
         .iter()
         .find(|header| header.field.equiv("Origin"))
         .map(|header| header.value.as_str().to_string())
+}
+
+pub fn origin_from_header_map(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
 }
 
 pub fn is_allowed_browser_origin(origin: &str) -> bool {
@@ -22,25 +42,46 @@ pub fn is_allowed_browser_origin(origin: &str) -> bool {
         || origin == "https://tauri.localhost"
 }
 
-pub fn local_cors_headers(origin: Option<&str>, allow_headers: &str) -> Vec<Header> {
+/// Header name/value pairs implementing the CORS policy. Transport-agnostic;
+/// each server converts them to its own header type.
+pub fn cors_header_pairs(origin: Option<&str>, allow_headers: &str) -> Vec<(String, String)> {
     let mut headers = vec![
-        Header::from_bytes("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS").unwrap(),
-        Header::from_bytes("Access-Control-Allow-Headers", allow_headers).unwrap(),
-        Header::from_bytes("Content-Type", "application/json").unwrap(),
+        (
+            "Access-Control-Allow-Methods".to_string(),
+            CORS_ALLOW_METHODS.to_string(),
+        ),
+        (
+            "Access-Control-Allow-Headers".to_string(),
+            allow_headers.to_string(),
+        ),
+        ("Content-Type".to_string(), "application/json".to_string()),
     ];
     if let Some(origin) = origin.filter(|origin| is_allowed_browser_origin(origin)) {
-        headers.push(Header::from_bytes("Access-Control-Allow-Origin", origin).unwrap());
-        headers.push(Header::from_bytes("Vary", "Origin").unwrap());
-        headers.push(Header::from_bytes("Access-Control-Allow-Private-Network", "true").unwrap());
+        headers.push((
+            "Access-Control-Allow-Origin".to_string(),
+            origin.to_string(),
+        ));
+        headers.push(("Vary".to_string(), "Origin".to_string()));
+        headers.push((
+            "Access-Control-Allow-Private-Network".to_string(),
+            "true".to_string(),
+        ));
     }
     headers
+}
+
+pub fn local_cors_headers(origin: Option<&str>, allow_headers: &str) -> Vec<tiny_http::Header> {
+    cors_header_pairs(origin, allow_headers)
+        .into_iter()
+        .filter_map(|(name, value)| tiny_http::Header::from_bytes(name, value).ok())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn header_value(headers: &[Header], name: &str) -> Option<String> {
+    fn header_value(headers: &[tiny_http::Header], name: &str) -> Option<String> {
         headers
             .iter()
             .find(|header| header.field.as_str().to_string().eq_ignore_ascii_case(name))
@@ -104,5 +145,19 @@ mod tests {
 
         let missing = local_cors_headers(None, "Content-Type");
         assert!(header_value(&missing, "Access-Control-Allow-Origin").is_none());
+    }
+
+    #[test]
+    fn header_map_origin_is_read_case_insensitively() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "http://localhost:1420".parse().unwrap(),
+        );
+        assert_eq!(
+            origin_from_header_map(&headers).as_deref(),
+            Some("http://localhost:1420")
+        );
+        assert_eq!(origin_from_header_map(&HeaderMap::new()), None);
     }
 }

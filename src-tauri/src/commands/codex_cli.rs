@@ -14,7 +14,7 @@ use std::sync::{
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -230,9 +230,9 @@ pub async fn codex_cli_spawn(
             match reader.next_line().await {
                 Ok(Some(line)) => {
                     append_capped_line(&mut stdout_text, &line, STDOUT_LIMIT_BYTES);
-                    if app.emit(&topic, line).is_err() {
-                        break;
-                    }
+                    // See claude_cli: the SSE bus never errors, so emission
+                    // no longer gates the read loop.
+                    crate::events::emit(&app, &topic, line);
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -273,7 +273,8 @@ pub async fn codex_cli_spawn(
             exit_code
         };
 
-        let _ = app.emit(
+        crate::events::emit(
+            &app,
             &done_topic,
             serde_json::json!({
                 "code": code,
@@ -282,7 +283,6 @@ pub async fn codex_cli_spawn(
             }),
         );
     });
-
     Ok(())
 }
 
