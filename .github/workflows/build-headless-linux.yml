@@ -29,18 +29,37 @@ jobs:
     timeout-minutes: 120
     steps:
       # actions/checkout and the other JS actions need node and git inside the
-      # container, so the toolchain install must come first.
-      - name: Install build toolchain
+      # container, so the toolchain install must come first. Kept as separate
+      # steps so a failure points at the exact command; dnf metadata/mirror
+      # hiccups are retried.
+      - name: Refresh dnf metadata
         run: |
-          dnf groupinstall -y "Development Tools"
-          dnf install -y git curl protobuf-compiler openssl-devel cmake
-          dnf module install -y nodejs:20/common
+          set -euxo pipefail
+          for i in 1 2 3; do dnf makecache && break || sleep 15; done
+
+      - name: Install compilers and native deps
+        run: |
+          set -euxo pipefail
+          for i in 1 2 3; do
+            dnf groupinstall -y "Development Tools" && \
+            dnf install -y git curl protobuf-compiler openssl-devel cmake && break || sleep 15
+          done
           dnf clean all
+
+      - name: Install Node.js 20
+        run: |
+          set -euxo pipefail
+          dnf module install -y nodejs:20/common
+          node --version
+          npm --version
+
+      - name: Install Rust toolchain
+        run: |
+          set -euxo pipefail
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          node --version
-          cargo --version || "$HOME/.cargo/bin/cargo" --version
+          "$HOME/.cargo/bin/cargo" --version
 
       - uses: actions/checkout@v4
 
