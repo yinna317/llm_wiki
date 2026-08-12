@@ -64,7 +64,9 @@ jobs:
           set -euxo pipefail
           curl -sSfL -o /tmp/protoc.zip \
             https://github.com/protocolbuffers/protobuf/releases/download/v25.6/protoc-25.6-linux-x86_64.zip
-          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc
+          # Extract the whole zip: protoc resolves the well-known types
+          # (google/protobuf/*.proto) from <bindir>/../include.
+          unzip -o /tmp/protoc.zip -d /usr/local
           chmod +x /usr/local/bin/protoc
           protoc --version
 

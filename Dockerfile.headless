@@ -28,7 +28,7 @@ RUN dnf install -y dnf-plugins-core && \
 # Install a current protoc binary release instead.
 RUN curl -sSfL -o /tmp/protoc.zip \
         https://github.com/protocolbuffers/protobuf/releases/download/v25.6/protoc-25.6-linux-x86_64.zip && \
-    unzip -o /tmp/protoc.zip -d /usr/local bin/protoc && \
+    unzip -o /tmp/protoc.zip -d /usr/local && \
     chmod +x /usr/local/bin/protoc && \
     protoc --version
 
