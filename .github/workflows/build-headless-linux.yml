@@ -132,7 +132,12 @@ jobs:
 
       - name: Build frontend
         run: |
+          # mcp-server/dist is declared as a bundle resource in
+          # tauri.conf.json; tauri-build verifies it exists even for the
+          # headless build, so the mcp-server must be built too.
           npm ci
+          npm --prefix mcp-server ci
+          npm run mcp:build
           npm run build
 
       - name: Build headless binary

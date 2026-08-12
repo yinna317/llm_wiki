@@ -61,8 +61,11 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /build
 COPY . .
 
-# Frontend + headless backend binary
+# Frontend + headless backend binary. mcp-server/dist is a declared bundle
+# resource in tauri.conf.json, so it must be built even for headless.
 RUN npm ci && \
+    npm --prefix mcp-server ci && \
+    npm run mcp:build && \
     npm run build && \
     cargo build --release --manifest-path src-tauri/Cargo.toml \
         --no-default-features --features headless
