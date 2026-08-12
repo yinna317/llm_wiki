@@ -27,6 +27,9 @@ jobs:
     runs-on: ubuntu-latest
     container: almalinux:9
     timeout-minutes: 120
+    env:
+      # Shadow/stub .pc files prepared by the deps step (see its comment).
+      PKG_CONFIG_PATH: /opt/pc-shadow
     steps:
       # actions/checkout and the other JS actions need node and git inside the
       # container, so the toolchain install must come first. Kept as separate
@@ -46,19 +49,46 @@ jobs:
           done
           dnf clean all
 
-      # tauri-runtime 2.x declares gtk + webkit2gtk as NON-optional Linux
-      # dependencies (they back its gtk_window()-style APIs), so even a
-      # wry-free build must compile gtk-sys/webkit2gtk-sys. Those target the
-      # 4.0 ABI, which EL9 ships as gtk3-devel / webkit2gtk3-devel (the
-      # -devel packages live in CRB). The MockRuntime path never calls into
-      # them; the linkage check below verifies the final binary does not
-      # retain GTK/WebKit in its DT_NEEDED entries.
-      - name: Install GTK/WebKit build-time deps
+      # tauri 2.x (core + tauri-runtime) declares gtk and webkit2gtk as
+      # NON-optional Linux dependencies, so even the wry-free headless build
+      # must satisfy their pkg-config probes:
+      #   * gtk3/glib: real EL9 packages work, but gtk-rs 0.18 demands
+      #     glib >= 2.70 (soup3 -> gio v2_70) while EL9 pins glib 2.68.4 —
+      #     shadow the glib-family .pc files with only the Version bumped.
+      #   * webkit2gtk-4.1 / javascriptcoregtk-4.1 / libsoup-3.0: not shipped
+      #     by EL9 at all (4.1 ABI is Fedora 40+/RHEL 10) — provide minimal
+      #     .pc files and empty stub shared objects.
+      # None of these libraries is ever called on the MockRuntime path, and
+      # rustc links with --as-needed, so unreferenced libs drop out of
+      # DT_NEEDED; the linkage check below fails the build if any WebKit
+      # stub survives into the shipped binary.
+      - name: Install/shim GTK/WebKit build-time deps
         run: |
           set -euxo pipefail
           dnf config-manager --set-enabled crb
-          dnf install -y gtk3-devel webkit2gtk3-devel
-          pkg-config --modversion glib-2.0 gtk+-3.0 webkit2gtk-4.0
+          dnf install -y gtk3-devel glib2-devel
+
+          shadow=/opt/pc-shadow
+          mkdir -p "$shadow"
+          for pc in /usr/lib64/pkgconfig/{glib,gobject,gio,gmodule,gthread}*.pc; do
+            sed 's/^Version:.*/Version: 2.70.0/' "$pc" > "$shadow/$(basename "$pc")"
+          done
+
+          stub=/opt/webkit-stub
+          mkdir -p "$stub/lib" "$stub/include"
+          for lib in webkit2gtk-4.1 javascriptcoregtk-4.1 soup-3.0; do
+            echo 'void __llm_wiki_stub(void){}' | gcc -shared -fPIC -x c - \
+              -Wl,-soname,"lib$lib.so.0" -o "$stub/lib/lib$lib.so.0"
+            ln -sf "lib$lib.so.0" "$stub/lib/lib$lib.so"
+          done
+          write_pc() {
+            printf 'prefix=/opt/webkit-stub\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: %s\nDescription: stub for headless build\nVersion: %s\nLibs: -L${libdir} -l%s\nCflags: -I${includedir}\n' "$1" "$2" "$3" > "$shadow/$1.pc"
+          }
+          write_pc webkit2gtk-4.1 2.46.0 webkit2gtk-4.1
+          write_pc javascriptcoregtk-4.1 2.46.0 javascriptcoregtk-4.1
+          write_pc libsoup-3.0 3.6.0 soup-3.0
+
+          PKG_CONFIG_PATH="$shadow" pkg-config --modversion glib-2.0 gtk+-3.0 webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0
 
       - name: Install Node.js 20
         run: |
@@ -93,15 +123,21 @@ jobs:
             --no-default-features --features headless
 
       # With rustc's default --as-needed linking, libraries whose symbols are
-      # never referenced (GTK/WebKit in the MockRuntime path) should be absent
-      # from DT_NEEDED. If they show up here, the server must also
-      # `dnf install gtk3 webkit2gtk3` — report it loudly rather than fail.
+      # never referenced (GTK/WebKit on the MockRuntime path) should be absent
+      # from DT_NEEDED. The webkit/jsc/soup stubs do not exist on real EL9
+      # servers, so any surviving reference to them is a hard failure; glib/
+      # gtk linkage would only mean the server needs those (installable)
+      # packages, so that is a warning.
       - name: Inspect runtime linkage
         run: |
           set -euxo pipefail
           ldd src-tauri/target/release/llm-wiki
-          if ldd src-tauri/target/release/llm-wiki | grep -Ei 'webkit|javascriptcore|gtk-|glib-2|soup|gdk|cairo|pango'; then
-            echo "::warning::binary retains GTK/WebKit runtime linkage; servers need gtk3+webkit2gtk3 installed"
+          if ldd src-tauri/target/release/llm-wiki | grep -Ei 'webkit2gtk-4\.1|javascriptcoregtk-4\.1|libsoup-3'; then
+            echo "::error::binary references stubbed WebKit libraries; it cannot run on EL9"
+            exit 1
+          fi
+          if ldd src-tauri/target/release/llm-wiki | grep -Ei 'gtk-3|glib-2|gdk|cairo|pango'; then
+            echo "::warning::binary retains GTK runtime linkage; servers need gtk3 installed"
           else
             echo "OK: no GTK/WebKit runtime linkage"
           fi

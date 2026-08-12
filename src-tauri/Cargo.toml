@@ -36,12 +36,13 @@ desktop = [
 # Headless build: drops wry (and therefore the webview / Webview2 runtime)
 # and the dialog plugin (rfd -> gtk on Linux), using tauri's MockRuntime to
 # drive the app without a window so the `serve` subcommand runs on stock
-# servers (Rocky/RHEL 9, containers). Caveat: tauri-runtime 2.x declares
-# gtk + webkit2gtk as non-optional Linux BUILD dependencies, so building on
-# Linux still needs gtk3-devel + webkit2gtk3-devel (EL9's 4.0 ABI packages,
-# available in AppStream/CRB — no webkit2gtk-4.1 required). The MockRuntime
-# path never calls into them; CI checks with ldd that the shipped binary
-# keeps no GTK/WebKit DT_NEEDED entries. Build with:
+# servers (Rocky/RHEL 9, containers). Caveat: tauri 2.x declares gtk +
+# webkit2gtk as non-optional Linux BUILD dependencies whose pkg-config
+# probes must pass — on EL9 that means gtk3-devel/glib2-devel plus version
+# shadows and WebKit stubs (see .github/workflows/build-headless-linux.yml
+# or Dockerfile.headless). The MockRuntime path never calls into them; CI
+# checks with ldd that the shipped binary keeps no WebKit DT_NEEDED entries.
+# Build with:
 #   cargo build --release --no-default-features --features headless
 # `protocol-asset` stays in the base tauri declaration below because
 # tauri-build statically checks it against tauri.conf.json's assetProtocol.

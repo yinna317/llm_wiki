@@ -8,17 +8,43 @@
 
 FROM almalinux:9
 
-# Build tools + native deps. tauri-runtime declares gtk + webkit2gtk as
-# non-optional Linux BUILD dependencies (the webkit2gtk crate targets the 4.0
-# ABI = EL9's webkit2gtk3, not the 4.1 ABI that only Fedora/RHEL10 ship), so
-# the -devel packages must be present even though the headless binary never
-# calls into them at runtime.
+# Build tools + native deps. tauri 2.x declares gtk + webkit2gtk as
+# non-optional Linux BUILD dependencies, so their pkg-config probes must
+# pass even though the headless binary never calls into them:
+#   * gtk3/glib: real EL9 packages; the glib-family .pc files get a shadow
+#     copy with Version bumped (EL9 pins 2.68.4, gtk-rs 0.18 wants >= 2.70).
+#   * webkit2gtk-4.1 / javascriptcoregtk-4.1 / libsoup-3.0: not shipped by
+#     EL9 at all, so we install stub .pc files + empty stub shared objects.
+# rustc links with --as-needed, so these unreferenced libs drop out of the
+# binary's DT_NEEDED (verify with: ldd target/release/llm-wiki).
 RUN dnf groupinstall -y "Development Tools" && \
     dnf install -y dnf-plugins-core protobuf-compiler openssl-devel cmake && \
     dnf config-manager --set-enabled crb && \
-    dnf install -y gtk3-devel webkit2gtk3-devel && \
+    dnf install -y gtk3-devel glib2-devel && \
     dnf module install -y nodejs:20/common && \
     dnf clean all
+
+RUN set -eux; \
+    shadow=/opt/pc-shadow; \
+    mkdir -p "$shadow"; \
+    for pc in /usr/lib64/pkgconfig/{glib,gobject,gio,gmodule,gthread}*.pc; do \
+        sed 's/^Version:.*/Version: 2.70.0/' "$pc" > "$shadow/$(basename "$pc")"; \
+    done; \
+    stub=/opt/webkit-stub; \
+    mkdir -p "$stub/lib" "$stub/include"; \
+    for lib in webkit2gtk-4.1 javascriptcoregtk-4.1 soup-3.0; do \
+        echo 'void __llm_wiki_stub(void){}' | gcc -shared -fPIC -x c - \
+            -Wl,-soname,"lib$lib.so.0" -o "$stub/lib/lib$lib.so.0"; \
+        ln -sf "lib$lib.so.0" "$stub/lib/lib$lib.so"; \
+    done; \
+    write_pc() { \
+        printf 'prefix=/opt/webkit-stub\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: %s\nDescription: stub for headless build\nVersion: %s\nLibs: -L${libdir} -l%s\nCflags: -I${includedir}\n' "$1" "$2" "$3" > "$shadow/$1.pc"; \
+    }; \
+    write_pc webkit2gtk-4.1 2.46.0 webkit2gtk-4.1; \
+    write_pc javascriptcoregtk-4.1 2.46.0 javascriptcoregtk-4.1; \
+    write_pc libsoup-3.0 3.6.0 soup-3.0
+
+ENV PKG_CONFIG_PATH=/opt/pc-shadow
 
 # Rust toolchain
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
