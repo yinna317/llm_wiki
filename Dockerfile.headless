@@ -8,9 +8,15 @@
 
 FROM almalinux:9
 
-# Build tools + native deps. No GTK/WebKit needed (headless build).
+# Build tools + native deps. tauri-runtime declares gtk + webkit2gtk as
+# non-optional Linux BUILD dependencies (the webkit2gtk crate targets the 4.0
+# ABI = EL9's webkit2gtk3, not the 4.1 ABI that only Fedora/RHEL10 ship), so
+# the -devel packages must be present even though the headless binary never
+# calls into them at runtime.
 RUN dnf groupinstall -y "Development Tools" && \
-    dnf install -y protobuf-compiler openssl-devel cmake && \
+    dnf install -y dnf-plugins-core protobuf-compiler openssl-devel cmake && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y gtk3-devel webkit2gtk3-devel && \
     dnf module install -y nodejs:20/common && \
     dnf clean all
 

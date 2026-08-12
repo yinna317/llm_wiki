@@ -42,9 +42,23 @@ jobs:
           set -euxo pipefail
           for i in 1 2 3; do
             dnf groupinstall -y "Development Tools" && \
-            dnf install -y git curl protobuf-compiler openssl-devel cmake && break || sleep 15
+            dnf install -y git curl dnf-plugins-core protobuf-compiler openssl-devel cmake && break || sleep 15
           done
           dnf clean all
+
+      # tauri-runtime 2.x declares gtk + webkit2gtk as NON-optional Linux
+      # dependencies (they back its gtk_window()-style APIs), so even a
+      # wry-free build must compile gtk-sys/webkit2gtk-sys. Those target the
+      # 4.0 ABI, which EL9 ships as gtk3-devel / webkit2gtk3-devel (the
+      # -devel packages live in CRB). The MockRuntime path never calls into
+      # them; the linkage check below verifies the final binary does not
+      # retain GTK/WebKit in its DT_NEEDED entries.
+      - name: Install GTK/WebKit build-time deps
+        run: |
+          set -euxo pipefail
+          dnf config-manager --set-enabled crb
+          dnf install -y gtk3-devel webkit2gtk3-devel
+          pkg-config --modversion glib-2.0 gtk+-3.0 webkit2gtk-4.0
 
       - name: Install Node.js 20
         run: |
@@ -77,6 +91,33 @@ jobs:
         run: |
           cargo build --release --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features headless
+
+      # With rustc's default --as-needed linking, libraries whose symbols are
+      # never referenced (GTK/WebKit in the MockRuntime path) should be absent
+      # from DT_NEEDED. If they show up here, the server must also
+      # `dnf install gtk3 webkit2gtk3` — report it loudly rather than fail.
+      - name: Inspect runtime linkage
+        run: |
+          set -euxo pipefail
+          ldd src-tauri/target/release/llm-wiki
+          if ldd src-tauri/target/release/llm-wiki | grep -Ei 'webkit|javascriptcore|gtk-|glib-2|soup|gdk|cairo|pango'; then
+            echo "::warning::binary retains GTK/WebKit runtime linkage; servers need gtk3+webkit2gtk3 installed"
+          else
+            echo "OK: no GTK/WebKit runtime linkage"
+          fi
+
+      - name: Smoke test serve mode
+        run: |
+          set -euxo pipefail
+          ./src-tauri/target/release/llm-wiki serve --no-open &
+          app_pid=$!
+          ok=""
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:19828/api/v1/ui-info; then ok=1; break; fi
+            sleep 1
+          done
+          kill "$app_pid" || true
+          test -n "$ok"
 
       - name: Package binary + frontend
         run: |
