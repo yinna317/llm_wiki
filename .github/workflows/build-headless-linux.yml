@@ -51,7 +51,7 @@ jobs:
           ok=""
           for i in 1 2 3; do
             dnf groupinstall -y "Development Tools" && \
-            dnf install -y git curl unzip openssl-devel cmake gtk3-devel glib2-devel && { ok=1; break; } || sleep 15
+            dnf install -y git unzip openssl-devel cmake gtk3-devel glib2-devel && { ok=1; break; } || sleep 15
           done
           test -n "$ok"
           dnf clean all
