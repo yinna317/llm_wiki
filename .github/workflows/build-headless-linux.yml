@@ -38,16 +38,35 @@ jobs:
       - name: Refresh dnf metadata
         run: |
           set -euxo pipefail
-          for i in 1 2 3; do dnf makecache && break || sleep 15; done
+          ok=""
+          for i in 1 2 3; do dnf makecache && { ok=1; break; } || sleep 15; done
+          test -n "$ok"
+          # Enable CRB up front: several -devel packages below live there.
+          dnf install -y dnf-plugins-core
+          dnf config-manager --set-enabled crb
 
       - name: Install compilers and native deps
         run: |
           set -euxo pipefail
+          ok=""
           for i in 1 2 3; do
             dnf groupinstall -y "Development Tools" && \
-            dnf install -y git curl dnf-plugins-core protobuf-compiler openssl-devel cmake && break || sleep 15
+            dnf install -y git curl unzip openssl-devel cmake gtk3-devel glib2-devel && { ok=1; break; } || sleep 15
           done
+          test -n "$ok"
           dnf clean all
+
+      # EL9's protobuf-compiler is 3.14, too old for lance's proto3 files
+      # (and it was silently skipped before CRB was enabled). Install a
+      # current protoc binary release instead; prost only needs the binary.
+      - name: Install protoc
+        run: |
+          set -euxo pipefail
+          curl -sSfL -o /tmp/protoc.zip \
+            https://github.com/protocolbuffers/protobuf/releases/download/v25.6/protoc-25.6-linux-x86_64.zip
+          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc
+          chmod +x /usr/local/bin/protoc
+          protoc --version
 
       # tauri 2.x (core + tauri-runtime) declares gtk and webkit2gtk as
       # NON-optional Linux dependencies, so even the wry-free headless build
@@ -65,9 +84,6 @@ jobs:
       - name: Install/shim GTK/WebKit build-time deps
         run: |
           set -euxo pipefail
-          dnf config-manager --set-enabled crb
-          dnf install -y gtk3-devel glib2-devel
-
           shadow=/opt/pc-shadow
           mkdir -p "$shadow"
           for pc in /usr/lib64/pkgconfig/{glib,gobject,gio,gmodule,gthread}*.pc; do
